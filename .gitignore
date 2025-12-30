@@ -84,6 +84,7 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+bc_discrete_train_expert.ipynb
 
 # IPython
 profile_default/
