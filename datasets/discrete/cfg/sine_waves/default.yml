@@ -1,0 +1,20 @@
+dataset_id: "SineWaves-v0/oracle-discrete-v0"
+data_format: "hdf5"
+episodes: 200
+seed: 0
+
+env:
+  min_length: 50
+  max_length: 200
+  dt: 1.0
+
+  min_amplitude: 0.5
+  max_amplitude: 2.0
+  n_amp_levels: 1
+
+  min_frequency: 0.2
+  max_frequency: 2.0
+  n_freq_levels: 1
+
+  n_action_bins: 101
+
