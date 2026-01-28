@@ -12,9 +12,8 @@ dependencies:
   - pandas
   - papermill
   - pydantic=2.5.3
-  - mujoco<3
-  - pip
   - pip:
+      - mujoco<3
       - minari[hf,hdf5,create]
       - pyrallis
       - gymnasium[other]
