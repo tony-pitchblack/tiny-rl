@@ -22,7 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from dotenv import load_dotenv
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
@@ -64,14 +64,20 @@ class GRU4Rec(nn.Module):
     def __init__(self, vocab_size: int, hidden_size: int = 128, emb_dim: int = 64):
         super().__init__()
         self.vocab_size = int(vocab_size)
-        self.emb = nn.Embedding(self.vocab_size, emb_dim)
+        self.pad_token = int(vocab_size)
+        self.emb = nn.Embedding(self.vocab_size + 1, emb_dim)
         self.rnn = nn.GRU(input_size=emb_dim, hidden_size=hidden_size, batch_first=True)
-        self.out = nn.Embedding(self.vocab_size, hidden_size)
+        self.out = nn.Embedding(self.vocab_size + 1, hidden_size)
 
     def step(self, input_ids: torch.Tensor, h: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.emb(input_ids)
         y, h = self.rnn(x, h)
         return y[:, 0, :], h
+
+    def forward_states(self, input_ids: torch.Tensor, h: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.emb(input_ids)
+        y, h = self.rnn(x, h)
+        return y, h
 
     def score_items(self, h_t: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
         v = self.out(item_ids)
@@ -148,7 +154,55 @@ def collate_token_sequences(batch: list[torch.Tensor], pad_token: int) -> dict[s
     tokens = torch.full((B, max_L), pad_token, dtype=torch.long)
     for i, (seq, L) in enumerate(zip(batch, lengths)):
         tokens[i, :L] = seq
-    return {"tokens": tokens}
+    return {"tokens": tokens, "lengths": torch.as_tensor(lengths, dtype=torch.long)}
+
+
+class _TokenSequenceDataset(Dataset):
+    def __init__(self, sequences: list[torch.Tensor]):
+        self.sequences = sequences
+
+    def __len__(self) -> int:
+        return int(len(self.sequences))
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        return self.sequences[int(idx)]
+
+
+def _slice_token_windows(
+    tokens: torch.Tensor,
+    lengths: torch.Tensor,
+    *,
+    window: int,
+    pad_token: int,
+    mode: str,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, L = tokens.shape
+    W = int(window)
+    if W <= 0:
+        raise ValueError("window must be positive")
+    Wp1 = W + 1
+
+    lengths = lengths.to(device=tokens.device, dtype=torch.long)
+    max_start = (lengths - Wp1).clamp(min=0)
+    if mode == "last":
+        start = max_start
+    elif mode == "random":
+        u = torch.rand((B,), device=tokens.device, generator=generator)
+        start = (u * (max_start + 1).to(torch.float32)).to(torch.long)
+    else:
+        raise ValueError("mode must be 'random' or 'last'")
+
+    ar = torch.arange(Wp1, device=tokens.device)
+    idx = (start[:, None] + ar[None, :]).clamp(max=L - 1)
+    win = tokens.gather(1, idx)
+    x = win[:, :-1]
+    y = win[:, 1:]
+
+    pos_y = start[:, None] + torch.arange(1, Wp1, device=tokens.device)[None, :]
+    valid = pos_y < lengths[:, None]
+    valid = valid & y.ne(int(pad_token))
+    return x, y, valid
 
 
 def _build_sa2c_sequences(
@@ -510,38 +564,66 @@ def main() -> None:
             hidden_size = int(dataset_cfg.get("hidden_size", 128))
             lr = float(dataset_cfg.get("lr", 3e-4))
             ndcg_k = int(dataset_cfg.get("ndcg_k", 10))
+            slice_len = int(dataset_cfg.get("slice_len", int(dataset_cfg.get("max_seq_len", 50))))
+            train_batches_per_epoch = dataset_cfg.get("train_batches_per_epoch", None)
+            val_batches_per_epoch = dataset_cfg.get("val_batches_per_epoch", None)
 
             model = GRU4Rec(vocab_size=vocab_size, hidden_size=hidden_size, emb_dim=emb_dim).to(device)
             opt = torch.optim.AdamW(model.parameters(), lr=lr)
             torch.save(model.state_dict(), best_model_path)
+
+            pad_token = int(model.pad_token)
+            train_ds = _TokenSequenceDataset(train_seqs)
+            val_ds = _TokenSequenceDataset(val_seqs)
+
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=lambda b: collate_token_sequences(b, pad_token),
+            )
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=lambda b: collate_token_sequences(b, pad_token),
+            )
 
             pbar = tqdm(range(n_epochs), desc="epochs", dynamic_ncols=True)
             for epoch in range(n_epochs):
                 model.train()
                 train_loss_sum = 0.0
                 train_n = 0
-                step_seed = seed + 1000 * epoch
+                step_seed = int(seed + 1000 * epoch)
+                g = torch.Generator(device=device)
+                g.manual_seed(step_seed)
 
-                h = None
-                pending_reset = None
-                pending_drop: set[int] | None = None
-                step_idx = 0
-                for x, y, reset, drop in _iter_session_parallel_steps(
-                    train_seqs, batch_size=batch_size, seed=step_seed, shuffle=True, device=device
-                ):
-                    if h is not None:
-                        h = h.detach()
-                        if pending_drop:
-                            keep = [i for i in range(h.shape[1]) if i not in pending_drop]
-                            h = h[:, keep, :]
-                        if pending_reset is not None and bool(pending_reset.any().item()):
-                            h = h.clone()
-                            h[:, pending_reset, :] = 0
+                for batch_idx, batch in enumerate(train_loader):
+                    if train_batches_per_epoch is not None and batch_idx >= int(train_batches_per_epoch):
+                        break
+                    tokens = batch["tokens"].to(device)
+                    lengths = batch["lengths"].to(device)
+                    W = min(int(slice_len), int(tokens.shape[1]) - 1)
+                    if W <= 0:
+                        continue
 
-                    h_t, h = model.step(x, h)
-                    neg = _inbatch_negative_targets(y, seed=step_seed + step_idx)
-                    pos_scores = model.score_items(h_t, y)
-                    neg_scores = model.score_items(h_t, neg)
+                    x, y, valid = _slice_token_windows(
+                        tokens,
+                        lengths,
+                        window=W,
+                        pad_token=pad_token,
+                        mode="random",
+                        generator=g,
+                    )
+                    h_seq, _ = model.forward_states(x, h=None)
+                    h_flat = h_seq[valid]
+                    y_flat = y[valid]
+                    if int(y_flat.numel()) == 0:
+                        continue
+
+                    neg = _inbatch_negative_targets(y_flat, seed=step_seed + batch_idx)
+                    pos_scores = model.score_items(h_flat, y_flat)
+                    neg_scores = model.score_items(h_flat, neg)
                     loss = -F.logsigmoid(pos_scores - neg_scores).mean()
 
                     opt.zero_grad()
@@ -549,17 +631,9 @@ def main() -> None:
                     opt.step()
 
                     with torch.no_grad():
-                        B = int(y.shape[0])
-                        train_loss_sum += float(loss.item()) * B
-                        train_n += B
-
-                    if drop:
-                        keep = [i for i in range(int(reset.shape[0])) if i not in drop]
-                        pending_reset = reset[keep]
-                    else:
-                        pending_reset = reset
-                    pending_drop = drop
-                    step_idx += 1
+                        n = int(y_flat.shape[0])
+                        train_loss_sum += float(loss.item()) * n
+                        train_n += n
 
                 model.eval()
                 val_loss_sum = 0.0
@@ -568,40 +642,41 @@ def main() -> None:
                 val_ndcg_n = 0
 
                 with torch.no_grad():
-                    h = None
-                    pending_reset = None
-                    pending_drop = None
-                    step_idx = 0
-                    for x, y, reset, drop in _iter_session_parallel_steps(
-                        val_seqs, batch_size=batch_size, seed=seed, shuffle=False, device=device
-                    ):
-                        if h is not None:
-                            if pending_drop:
-                                keep = [i for i in range(h.shape[1]) if i not in pending_drop]
-                                h = h[:, keep, :]
-                            if pending_reset is not None and bool(pending_reset.any().item()):
-                                h = h.clone()
-                                h[:, pending_reset, :] = 0
+                    vg = torch.Generator(device=device)
+                    vg.manual_seed(int(seed))
+                    for batch_idx, batch in enumerate(val_loader):
+                        if val_batches_per_epoch is not None and batch_idx >= int(val_batches_per_epoch):
+                            break
+                        tokens = batch["tokens"].to(device)
+                        lengths = batch["lengths"].to(device)
+                        W = min(int(slice_len), int(tokens.shape[1]) - 1)
+                        if W <= 0:
+                            continue
 
-                        h_t, h = model.step(x, h)
-                        neg = _inbatch_negative_targets(y, seed=seed + step_idx)
-                        pos_scores = model.score_items(h_t, y)
-                        neg_scores = model.score_items(h_t, neg)
+                        x, y, valid = _slice_token_windows(
+                            tokens,
+                            lengths,
+                            window=W,
+                            pad_token=pad_token,
+                            mode="last",
+                            generator=vg,
+                        )
+                        h_seq, _ = model.forward_states(x, h=None)
+                        h_flat = h_seq[valid]
+                        y_flat = y[valid]
+                        if int(y_flat.numel()) == 0:
+                            continue
+
+                        neg = _inbatch_negative_targets(y_flat, seed=int(seed) + batch_idx)
+                        pos_scores = model.score_items(h_flat, y_flat)
+                        neg_scores = model.score_items(h_flat, neg)
                         vloss = -F.logsigmoid(pos_scores - neg_scores).mean()
 
-                        B = int(y.shape[0])
-                        val_loss_sum += float(vloss.item()) * B
-                        val_n += B
-                        val_ndcg_sum += _ndcg_at_k_from_pos_neg(pos_scores, neg_scores.unsqueeze(1), k=ndcg_k) * B
-                        val_ndcg_n += B
-
-                        if drop:
-                            keep = [i for i in range(int(reset.shape[0])) if i not in drop]
-                            pending_reset = reset[keep]
-                        else:
-                            pending_reset = reset
-                        pending_drop = drop
-                        step_idx += 1
+                        n = int(y_flat.shape[0])
+                        val_loss_sum += float(vloss.item()) * n
+                        val_n += n
+                        val_ndcg_sum += _ndcg_at_k_from_pos_neg(pos_scores, neg_scores.unsqueeze(1), k=ndcg_k) * n
+                        val_ndcg_n += n
 
                 train_loss = train_loss_sum / max(train_n, 1)
                 val_loss = val_loss_sum / max(val_n, 1)
