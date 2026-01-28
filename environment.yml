@@ -1,7 +1,4 @@
 name: tiny-rl
-channels:
-  - conda-forge
-  - defaults
 dependencies:
   - python
   - numpy
