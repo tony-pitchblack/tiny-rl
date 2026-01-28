@@ -1,0 +1,4 @@
+is_sa2c_code_dataset: true
+batch_size: 5000
+dataset_id: "RetailRocket-splits=SA2C_code"
+max_seq_len: 50

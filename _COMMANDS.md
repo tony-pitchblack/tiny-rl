@@ -19,3 +19,10 @@ source .venv/bin/activate
 python train_seq2seq_discrete.py --dataset_config datasets/discrete/cfg/sine_waves/default.yml
 ```
 
+## Train RetailRocket GRU4Rec-style model (logs to MLflow)
+
+```bash
+source .venv/bin/activate
+python train_seq2seq_discrete.py --dataset_config datasets/discrete/cfg/retailrocket.yml
+```
+

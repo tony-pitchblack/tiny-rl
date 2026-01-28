@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import minari
 import mlflow
 import numpy as np
+import pandas as pd
 import requests
 import torch
 import torch.nn as nn
@@ -44,6 +45,37 @@ class GRUPolicy(nn.Module):
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         h, _ = self.rnn(obs)
         return self.head(h)
+
+
+class TokenGRUPolicy(nn.Module):
+    def __init__(self, vocab_size: int, hidden_size: int = 128, emb_dim: int = 64):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size + 1, emb_dim)
+        self.rnn = nn.GRU(input_size=emb_dim, hidden_size=hidden_size, batch_first=True)
+        self.head = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        x = self.emb(input_ids)
+        h, _ = self.rnn(x)
+        return self.head(h)
+
+
+class GRU4Rec(nn.Module):
+    def __init__(self, vocab_size: int, hidden_size: int = 128, emb_dim: int = 64):
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+        self.emb = nn.Embedding(self.vocab_size, emb_dim)
+        self.rnn = nn.GRU(input_size=emb_dim, hidden_size=hidden_size, batch_first=True)
+        self.out = nn.Embedding(self.vocab_size, hidden_size)
+
+    def step(self, input_ids: torch.Tensor, h: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.emb(input_ids)
+        y, h = self.rnn(x, h)
+        return y[:, 0, :], h
+
+    def score_items(self, h_t: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
+        v = self.out(item_ids)
+        return (h_t * v).sum(dim=-1)
 
 
 def _load_yaml(path: str | Path) -> dict[str, Any]:
@@ -107,6 +139,171 @@ def collate_fn(batch):
         "mask": mask,
         "lengths": torch.as_tensor(lengths, dtype=torch.long),
     }
+
+
+def collate_token_sequences(batch: list[torch.Tensor], pad_token: int) -> dict[str, torch.Tensor]:
+    lengths = [int(x.numel()) for x in batch]
+    B = len(batch)
+    max_L = max(lengths)
+    tokens = torch.full((B, max_L), pad_token, dtype=torch.long)
+    for i, (seq, L) in enumerate(zip(batch, lengths)):
+        tokens[i, :L] = seq
+    return {"tokens": tokens}
+
+
+def _build_sa2c_sequences(
+    df: pd.DataFrame,
+    *,
+    max_seq_len: int,
+    item2id: dict[int, int],
+) -> list[torch.Tensor]:
+    required = {"timestamp", "session_id", "item_id"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"SA2C_code dataframe missing columns: {sorted(missing)}")
+
+    df = df.loc[:, ["timestamp", "session_id", "item_id"]].copy()
+    df["item_id"] = df["item_id"].astype(np.int64)
+    df["session_id"] = df["session_id"].astype(np.int64)
+    df = df.sort_values(["session_id", "timestamp"], kind="mergesort")
+
+    sequences: list[torch.Tensor] = []
+    window = int(max_seq_len) + 1
+    for _, g in df.groupby("session_id", sort=False):
+        items = g["item_id"].to_numpy(dtype=np.int64, copy=False)
+        if items.size < 2:
+            continue
+        if items.size > window:
+            items = items[-window:]
+        mapped = np.fromiter((item2id[int(x)] for x in items), dtype=np.int64, count=items.size)
+        sequences.append(torch.from_numpy(mapped))
+    return sequences
+
+
+def _load_sa2c_pickles(dataset_cfg: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    data_dir_cfg = dataset_cfg.get("data_dir")
+    train_file = str(dataset_cfg.get("train_file", "sampled_train.df"))
+    val_file = str(dataset_cfg.get("val_file", "sampled_val.df"))
+
+    if data_dir_cfg is None:
+        base_dir = Path(__file__).resolve().parents[1]
+        data_dir = base_dir / "sasrec_sqn" / "SA2C_code" / "Kaggle" / "data"
+    else:
+        data_dir = Path(str(data_dir_cfg)).expanduser()
+        if not data_dir.is_absolute():
+            data_dir = (Path.cwd() / data_dir).resolve()
+
+    train_path = data_dir / train_file
+    val_path = data_dir / val_file
+    if not train_path.exists() or not val_path.exists():
+        raise FileNotFoundError(f"Missing SA2C_code pickles: {train_path.as_posix()} or {val_path.as_posix()}")
+
+    return pd.read_pickle(train_path), pd.read_pickle(val_path)
+
+
+def _iter_session_parallel_steps(
+    sequences: list[torch.Tensor],
+    *,
+    batch_size: int,
+    seed: int,
+    shuffle: bool,
+    device: torch.device,
+):
+    if len(sequences) == 0:
+        return
+
+    order = np.arange(len(sequences), dtype=np.int64)
+    rng = np.random.default_rng(int(seed))
+    if shuffle:
+        rng.shuffle(order)
+
+    next_ptr = 0
+    B = min(int(batch_size), int(len(sequences)))
+    batch_idxs = order[:B].tolist()
+    next_ptr = B
+    positions = [0] * B
+    reset = torch.zeros((B,), dtype=torch.bool, device=device)
+
+    while B > 0:
+        x = torch.empty((B, 1), dtype=torch.long, device=device)
+        y = torch.empty((B,), dtype=torch.long, device=device)
+        reset.fill_(False)
+
+        for i in range(B):
+            s = sequences[int(batch_idxs[i])]
+            p = int(positions[i])
+            x[i, 0] = int(s[p].item())
+            y[i] = int(s[p + 1].item())
+            positions[i] = p + 1
+
+        ended: list[int] = []
+        for i in range(B):
+            s = sequences[int(batch_idxs[i])]
+            if int(positions[i]) + 1 >= int(s.numel()):
+                ended.append(i)
+
+        drop: set[int] = set()
+        for i in ended:
+            if next_ptr < len(order):
+                batch_idxs[i] = int(order[next_ptr])
+                next_ptr += 1
+                positions[i] = 0
+                reset[i] = True
+            else:
+                drop.add(i)
+
+        yield x, y, reset, drop
+
+        if drop:
+            keep = [i for i in range(B) if i not in drop]
+            batch_idxs = [batch_idxs[i] for i in keep]
+            positions = [positions[i] for i in keep]
+            B = len(keep)
+            reset = reset[keep]
+
+
+def _inbatch_negative_targets(targets: torch.Tensor, *, seed: int) -> torch.Tensor:
+    B = int(targets.shape[0])
+    if B <= 1:
+        return targets.clone()
+    g = torch.Generator(device=targets.device)
+    g.manual_seed(int(seed))
+    perm = torch.randperm(B, generator=g, device=targets.device)
+    neg = targets[perm]
+    same = neg.eq(targets)
+    if same.any():
+        perm2 = (perm + 1) % B
+        neg = torch.where(same, targets[perm2], neg)
+    return neg
+
+
+def _ndcg_at_k_from_pos_neg(pos_scores: torch.Tensor, neg_scores: torch.Tensor, k: int) -> float:
+    if pos_scores.numel() == 0:
+        return 0.0
+    if neg_scores.numel() == 0:
+        return 1.0
+    rank = 1 + neg_scores.ge(pos_scores.unsqueeze(1)).sum(dim=1)
+    rank = rank.to(torch.float32)
+    k = float(max(1, int(k)))
+    dcg = torch.where(rank <= k, 1.0 / torch.log2(rank + 1.0), torch.zeros_like(rank))
+    return float(dcg.mean().item())
+
+
+def _ndcg_at_k_one_relevant(logits: torch.Tensor, targets: torch.Tensor, k: int = 10) -> float:
+    if targets.numel() == 0:
+        return 0.0
+    k = min(int(k), int(logits.shape[-1]))
+    topk = torch.topk(logits, k=k, dim=-1).indices
+    matches = topk.eq(targets.unsqueeze(1))
+    any_match = matches.any(dim=1)
+    ranks0 = matches.float().argmax(dim=1) + 1
+    ranks = torch.where(any_match, ranks0, torch.zeros_like(ranks0))
+    dcg = torch.where(
+        ranks > 0,
+        1.0 / torch.log2(ranks.to(torch.float32) + 1.0),
+        torch.zeros_like(ranks, dtype=torch.float32),
+    )
+    return float(dcg.mean().item())
 
 
 def make_train_val_masks(lengths: torch.Tensor, max_T: int, frac_val: float = 0.1):
@@ -229,34 +426,60 @@ def main() -> None:
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-    import gymnasium as gym
-
-    import datasets.discrete.envs.sine_waves  # noqa: F401
-
     dataset_id = str(dataset_cfg["dataset_id"])
-    if dataset_id not in minari.list_local_datasets():
-        raise FileNotFoundError(
-            f"Minari dataset {dataset_id} not found locally. Build it with: "
-            f"python datasets/discrete/build_dataset/sine_waves.py --config {dataset_cfg_path.as_posix()}"
+    is_sa2c_code_dataset = bool(dataset_cfg.get("is_sa2c_code_dataset", False))
+    batch_size = int(dataset_cfg.get("batch_size", 256))
+
+    ds = None
+    dataloader = None
+    val_dataloader = None
+    train_seqs = None
+    val_seqs = None
+    obs_dim = None
+    n_actions = None
+    vocab_size = None
+    pad_token = None
+
+    if is_sa2c_code_dataset:
+        max_seq_len = int(dataset_cfg.get("max_seq_len", 50))
+        train_df, val_df = _load_sa2c_pickles(dataset_cfg)
+
+        all_items = pd.concat([train_df["item_id"], val_df["item_id"]], ignore_index=True).astype(np.int64)
+        uniq = np.sort(all_items.unique())
+        item2id = {int(x): int(i) for i, x in enumerate(uniq)}
+        vocab_size = len(item2id)
+        train_seqs = _build_sa2c_sequences(train_df, max_seq_len=max_seq_len, item2id=item2id)
+        val_seqs = _build_sa2c_sequences(val_df, max_seq_len=max_seq_len, item2id=item2id)
+        if len(train_seqs) == 0 or len(val_seqs) == 0:
+            raise ValueError("No valid (len>=2) sessions found in SA2C_code pickles")
+    else:
+        import gymnasium as gym
+
+        import datasets.discrete.envs.sine_waves  # noqa: F401
+
+        if dataset_id not in minari.list_local_datasets():
+            raise FileNotFoundError(
+                f"Minari dataset {dataset_id} not found locally. Build it with: "
+                f"python datasets/discrete/build_dataset/sine_waves.py --config {dataset_cfg_path.as_posix()}"
+            )
+
+        ds = minari.load_dataset(dataset_id)
+        loader_rng = torch.Generator()
+        loader_rng.manual_seed(seed)
+        dataloader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            generator=loader_rng,
         )
 
-    ds = minari.load_dataset(dataset_id)
-    loader_rng = torch.Generator()
-    loader_rng.manual_seed(seed)
-    dataloader = DataLoader(
-        ds,
-        batch_size=256,
-        shuffle=True,
-        collate_fn=collate_fn,
-        generator=loader_rng,
-    )
-
-    env_cfg = dataset_cfg.get("env", {})
-    if not isinstance(env_cfg, dict):
-        raise ValueError("dataset_config.env must be a mapping")
-    env_tmp = gym.make("SineWaves-v0", **env_cfg)
-    obs_dim = int(np.prod(env_tmp.observation_space.shape))
-    n_actions = int(env_tmp.action_space.n)
+        env_cfg = dataset_cfg.get("env", {})
+        if not isinstance(env_cfg, dict):
+            raise ValueError("dataset_config.env must be a mapping")
+        env_tmp = gym.make("SineWaves-v0", **env_cfg)
+        obs_dim = int(np.prod(env_tmp.observation_space.shape))
+        n_actions = int(env_tmp.action_space.n)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -270,127 +493,253 @@ def main() -> None:
     with mlflow.start_run(run_name=f"{dataset_name}/{config_name}"):
         mlflow.log_params(_flatten_cfg(dataset_cfg, "dataset_config"))
 
-        bc = GRUPolicy(obs_dim=obs_dim, n_actions=n_actions).to(device)
-        opt = torch.optim.AdamW(bc.parameters(), lr=3e-4)
-        torch.save(bc.state_dict(), best_model_path)
-
-        patience_epochs = 10
-        n_epochs = 1000
-        eval_every_n_epochs = 50
+        patience_epochs = int(dataset_cfg.get("patience_epochs", 10))
+        n_epochs = int(dataset_cfg.get("n_epochs", 1000))
+        eval_every_n_epochs = int(dataset_cfg.get("eval_every_n_epochs", 50))
         frac_val = 0.1
 
         best_val_loss = float("inf")
         best_epoch = -1
         bad_epochs = 0
 
-        try:
-            steps_per_epoch = len(dataloader)
-        except TypeError:
-            steps_per_epoch = None
+        if is_sa2c_code_dataset:
+            assert vocab_size is not None
+            assert train_seqs is not None and val_seqs is not None
 
-        if steps_per_epoch is None:
+            emb_dim = int(dataset_cfg.get("emb_dim", 64))
+            hidden_size = int(dataset_cfg.get("hidden_size", 128))
+            lr = float(dataset_cfg.get("lr", 3e-4))
+            ndcg_k = int(dataset_cfg.get("ndcg_k", 10))
+
+            model = GRU4Rec(vocab_size=vocab_size, hidden_size=hidden_size, emb_dim=emb_dim).to(device)
+            opt = torch.optim.AdamW(model.parameters(), lr=lr)
+            torch.save(model.state_dict(), best_model_path)
+
             pbar = tqdm(range(n_epochs), desc="epochs", dynamic_ncols=True)
-        else:
-            pbar = tqdm(total=n_epochs * steps_per_epoch, desc="train", dynamic_ncols=True)
+            for epoch in range(n_epochs):
+                model.train()
+                train_loss_sum = 0.0
+                train_n = 0
+                step_seed = seed + 1000 * epoch
 
-        for epoch in range(n_epochs):
-            bc.train()
-            train_loss_sum = 0.0
-            train_n = 0
-            val_loss_sum = 0.0
-            val_n = 0
+                h = None
+                pending_reset = None
+                pending_drop: set[int] | None = None
+                step_idx = 0
+                for x, y, reset, drop in _iter_session_parallel_steps(
+                    train_seqs, batch_size=batch_size, seed=step_seed, shuffle=True, device=device
+                ):
+                    if h is not None:
+                        if pending_drop:
+                            keep = [i for i in range(h.shape[1]) if i not in pending_drop]
+                            h = h[:, keep, :]
+                        if pending_reset is not None and bool(pending_reset.any().item()):
+                            h = h.clone()
+                            h[:, pending_reset, :] = 0
 
-            for batch in dataloader:
-                obs = batch["observations"].to(device)
-                actions = batch["actions"].to(device)
-                mask = batch["mask"].to(device)
-                lengths = batch["lengths"]
+                    h_t, h = model.step(x, h)
+                    neg = _inbatch_negative_targets(y, seed=step_seed + step_idx)
+                    pos_scores = model.score_items(h_t, y)
+                    neg_scores = model.score_items(h_t, neg)
+                    loss = -F.logsigmoid(pos_scores - neg_scores).mean()
 
-                _, max_T, _ = obs.shape
-                train_mask, val_mask = make_train_val_masks(lengths, max_T=max_T, frac_val=frac_val)
-                train_mask = (train_mask.to(device) & mask)
-                val_mask = (val_mask.to(device) & mask)
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
 
-                logits = bc(obs)
-                train_logits = logits[train_mask]
-                train_actions = actions[train_mask]
-                loss = F.cross_entropy(train_logits, train_actions)
+                    with torch.no_grad():
+                        B = int(y.shape[0])
+                        train_loss_sum += float(loss.item()) * B
+                        train_n += B
 
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
+                    if drop:
+                        keep = [i for i in range(int(reset.shape[0])) if i not in drop]
+                        pending_reset = reset[keep]
+                    else:
+                        pending_reset = reset
+                    pending_drop = drop
+                    step_idx += 1
+
+                model.eval()
+                val_loss_sum = 0.0
+                val_n = 0
+                val_ndcg_sum = 0.0
+                val_ndcg_n = 0
 
                 with torch.no_grad():
-                    n_train = int(train_actions.numel())
-                    train_loss_sum += float(loss.item()) * n_train
-                    train_n += n_train
+                    h = None
+                    pending_reset = None
+                    pending_drop = None
+                    step_idx = 0
+                    for x, y, reset, drop in _iter_session_parallel_steps(
+                        val_seqs, batch_size=batch_size, seed=seed, shuffle=False, device=device
+                    ):
+                        if h is not None:
+                            if pending_drop:
+                                keep = [i for i in range(h.shape[1]) if i not in pending_drop]
+                                h = h[:, keep, :]
+                            if pending_reset is not None and bool(pending_reset.any().item()):
+                                h = h.clone()
+                                h[:, pending_reset, :] = 0
 
-                    val_logits = logits[val_mask]
-                    val_actions = actions[val_mask]
-                    if val_actions.numel() > 0:
-                        vloss = F.cross_entropy(val_logits, val_actions)
-                        n_val = int(val_actions.numel())
-                        val_loss_sum += float(vloss.item()) * n_val
-                        val_n += n_val
+                        h_t, h = model.step(x, h)
+                        neg = _inbatch_negative_targets(y, seed=seed + step_idx)
+                        pos_scores = model.score_items(h_t, y)
+                        neg_scores = model.score_items(h_t, neg)
+                        vloss = -F.logsigmoid(pos_scores - neg_scores).mean()
 
-                if steps_per_epoch is not None:
-                    pbar.update(1)
-                    pbar.set_postfix_str(
-                        f"epoch={epoch} train={train_loss_sum / max(train_n, 1):.4f} "
-                        f"val={val_loss_sum / max(val_n, 1):.4f}"
-                    )
+                        B = int(y.shape[0])
+                        val_loss_sum += float(vloss.item()) * B
+                        val_n += B
+                        val_ndcg_sum += _ndcg_at_k_from_pos_neg(pos_scores, neg_scores.unsqueeze(1), k=ndcg_k) * B
+                        val_ndcg_n += B
 
-            train_loss = train_loss_sum / max(train_n, 1)
-            val_loss = val_loss_sum / max(val_n, 1)
+                        if drop:
+                            keep = [i for i in range(int(reset.shape[0])) if i not in drop]
+                            pending_reset = reset[keep]
+                        else:
+                            pending_reset = reset
+                        pending_drop = drop
+                        step_idx += 1
 
-            mlflow.log_metric("train/loss", train_loss, step=epoch)
-            mlflow.log_metric("val/loss", val_loss, step=epoch)
+                train_loss = train_loss_sum / max(train_n, 1)
+                val_loss = val_loss_sum / max(val_n, 1)
 
-            if steps_per_epoch is None:
+                mlflow.log_metric("train/loss", train_loss, step=epoch)
+                mlflow.log_metric("val/loss", val_loss, step=epoch)
+                mlflow.log_metric(f"val/NDCG@{ndcg_k}", val_ndcg_sum / max(val_ndcg_n, 1), step=epoch)
+
                 pbar.set_postfix_str(f"train={train_loss:.4f} val={val_loss:.4f} bad={bad_epochs}")
                 pbar.update(1)
+
+                improved = val_loss < best_val_loss
+                if improved:
+                    best_val_loss = val_loss
+                    best_epoch = epoch
+                    bad_epochs = 0
+                    torch.save(model.state_dict(), best_model_path)
+                else:
+                    bad_epochs += 1
+
+                if bad_epochs >= patience_epochs:
+                    break
+
+            pbar.close()
+        else:
+            assert dataloader is not None
+            assert obs_dim is not None
+            bc = GRUPolicy(obs_dim=obs_dim, n_actions=n_actions).to(device)
+            opt = torch.optim.AdamW(bc.parameters(), lr=3e-4)
+            torch.save(bc.state_dict(), best_model_path)
+
+            try:
+                steps_per_epoch = len(dataloader)
+            except TypeError:
+                steps_per_epoch = None
+
+            if steps_per_epoch is None:
+                pbar = tqdm(range(n_epochs), desc="epochs", dynamic_ncols=True)
             else:
-                pbar.set_postfix_str(f"epoch={epoch} train={train_loss:.4f} val={val_loss:.4f} bad={bad_epochs}")
+                pbar = tqdm(total=n_epochs * steps_per_epoch, desc="train", dynamic_ncols=True)
 
-            improved = val_loss < best_val_loss
-            if improved:
-                best_val_loss = val_loss
-                best_epoch = epoch
-                bad_epochs = 0
-                torch.save(bc.state_dict(), best_model_path)
-            else:
-                bad_epochs += 1
+            for epoch in range(n_epochs):
+                bc.train()
+                train_loss_sum = 0.0
+                train_n = 0
+                val_loss_sum = 0.0
+                val_n = 0
 
-            if epoch % eval_every_n_epochs == 0:
-                fig = visualize_action_cells_on_val(
-                    model=bc,
-                    dataset=ds,
-                    n_actions=n_actions,
-                    frac_val=frac_val,
-                    seed=seed,
-                    epoch=epoch,
-                    device=device,
-                )
-                mlflow.log_figure(fig, f"viz/current/epoch_{epoch:05d}.png")
-                plt.close(fig)
+                for batch in dataloader:
+                    obs = batch["observations"].to(device)
+                    actions = batch["actions"].to(device)
+                    mask = batch["mask"].to(device)
+                    lengths = batch["lengths"]
 
-            if bad_epochs >= patience_epochs:
-                break
+                    _, max_T, _ = obs.shape
+                    train_mask, val_mask = make_train_val_masks(lengths, max_T=max_T, frac_val=frac_val)
+                    train_mask = (train_mask.to(device) & mask)
+                    val_mask = (val_mask.to(device) & mask)
 
-        pbar.close()
+                    logits = bc(obs)
+                    train_logits = logits[train_mask]
+                    train_targets = actions[train_mask]
+                    loss = F.cross_entropy(train_logits, train_targets)
 
-        fig_best = visualize_action_cells_on_val(
-            model=bc,
-            dataset=ds,
-            n_actions=n_actions,
-            frac_val=frac_val,
-            seed=seed,
-            epoch=best_epoch,
-            state_dict_path=best_model_path,
-            device=device,
-        )
-        mlflow.log_figure(fig_best, "viz/best.png")
-        plt.close(fig_best)
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+
+                    with torch.no_grad():
+                        n_train = int(train_targets.numel())
+                        train_loss_sum += float(loss.item()) * n_train
+                        train_n += n_train
+
+                        val_logits = logits[val_mask]
+                        val_targets = actions[val_mask]
+                        if val_targets.numel() > 0:
+                            vloss = F.cross_entropy(val_logits, val_targets)
+                            n_val = int(val_targets.numel())
+                            val_loss_sum += float(vloss.item()) * n_val
+                            val_n += n_val
+
+                    if steps_per_epoch is not None:
+                        pbar.update(1)
+                        pbar.set_postfix_str(
+                            f"epoch={epoch} train={train_loss_sum / max(train_n, 1):.4f} "
+                            f"val={val_loss_sum / max(val_n, 1):.4f}"
+                        )
+
+                train_loss = train_loss_sum / max(train_n, 1)
+                val_loss = val_loss_sum / max(val_n, 1)
+
+                mlflow.log_metric("train/loss", train_loss, step=epoch)
+                mlflow.log_metric("val/loss", val_loss, step=epoch)
+
+                if steps_per_epoch is None:
+                    pbar.set_postfix_str(f"train={train_loss:.4f} val={val_loss:.4f} bad={bad_epochs}")
+                    pbar.update(1)
+                else:
+                    pbar.set_postfix_str(f"epoch={epoch} train={train_loss:.4f} val={val_loss:.4f} bad={bad_epochs}")
+
+                improved = val_loss < best_val_loss
+                if improved:
+                    best_val_loss = val_loss
+                    best_epoch = epoch
+                    bad_epochs = 0
+                    torch.save(bc.state_dict(), best_model_path)
+                else:
+                    bad_epochs += 1
+
+                if epoch % eval_every_n_epochs == 0:
+                    fig = visualize_action_cells_on_val(
+                        model=bc,
+                        dataset=ds,
+                        n_actions=n_actions,
+                        frac_val=frac_val,
+                        seed=seed,
+                        epoch=epoch,
+                        device=device,
+                    )
+                    mlflow.log_figure(fig, f"viz/current/epoch_{epoch:05d}.png")
+                    plt.close(fig)
+
+                if bad_epochs >= patience_epochs:
+                    break
+
+            pbar.close()
+
+            fig_best = visualize_action_cells_on_val(
+                model=bc,
+                dataset=ds,
+                n_actions=n_actions,
+                frac_val=frac_val,
+                seed=seed,
+                epoch=best_epoch,
+                state_dict_path=best_model_path,
+                device=device,
+            )
+            mlflow.log_figure(fig_best, "viz/best.png")
+            plt.close(fig_best)
 
 
 if __name__ == "__main__":
