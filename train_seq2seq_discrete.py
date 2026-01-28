@@ -530,6 +530,7 @@ def main() -> None:
                     train_seqs, batch_size=batch_size, seed=step_seed, shuffle=True, device=device
                 ):
                     if h is not None:
+                        h = h.detach()
                         if pending_drop:
                             keep = [i for i in range(h.shape[1]) if i not in pending_drop]
                             h = h[:, keep, :]
@@ -607,7 +608,7 @@ def main() -> None:
 
                 mlflow.log_metric("train/loss", train_loss, step=epoch)
                 mlflow.log_metric("val/loss", val_loss, step=epoch)
-                mlflow.log_metric(f"val/NDCG@{ndcg_k}", val_ndcg_sum / max(val_ndcg_n, 1), step=epoch)
+                mlflow.log_metric(f"val/NDCG_at_{ndcg_k}", val_ndcg_sum / max(val_ndcg_n, 1), step=epoch)
 
                 pbar.set_postfix_str(f"train={train_loss:.4f} val={val_loss:.4f} bad={bad_epochs}")
                 pbar.update(1)
