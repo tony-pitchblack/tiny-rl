@@ -1,5 +1,10 @@
 # Commands
 
+## MLflow
+```
+./scripts/start_mlflow_tmux.sh
+```
+
 ## Build SineWaves oracle Minari dataset (from config)
 
 ```bash
