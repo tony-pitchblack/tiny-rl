@@ -185,13 +185,13 @@ def _load_sa2c_pickles(dataset_cfg: dict[str, Any]) -> tuple[pd.DataFrame, pd.Da
     train_file = str(dataset_cfg.get("train_file", "sampled_train.df"))
     val_file = str(dataset_cfg.get("val_file", "sampled_val.df"))
 
+    repo_root = Path(__file__).resolve().parent
     if data_dir_cfg is None:
-        base_dir = Path(__file__).resolve().parents[1]
-        data_dir = base_dir / "sasrec_sqn" / "SA2C_code" / "Kaggle" / "data"
+        data_dir = repo_root / "SA2C_code" / "Kaggle" / "data"
     else:
         data_dir = Path(str(data_dir_cfg)).expanduser()
         if not data_dir.is_absolute():
-            data_dir = (Path.cwd() / data_dir).resolve()
+            data_dir = (repo_root / data_dir).resolve()
 
     train_path = data_dir / train_file
     val_path = data_dir / val_file
